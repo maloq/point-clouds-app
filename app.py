@@ -440,18 +440,56 @@ def run_network_landscape_analysis(
         grid_res = 20
     
     # 1. Setup Data
-    source = generate_point_cloud(StructureType(struct_type), int(n_points), device=DEVICE)
-    source = normalize_point_cloud(source)
-    
-    # Target is deformed source
-    deform = Deformation(device=DEVICE)
-    deform.rotate(euler_angles=(np.radians(rot_x), np.radians(rot_y), np.radians(rot_z)))
-    if noise > 0:
-        deform.noise(std=noise)
-    if spherify > 0:
-        deform.spherify(intensity=spherify)
+    # Helper to generate batch
+    def generate_batch(bsize):
+        # Source is canonical
+        s = generate_point_cloud(StructureType(struct_type), int(n_points), device=DEVICE)
+        s = normalize_point_cloud(s)
+        s_batch = s.unsqueeze(0).repeat(bsize, 1, 1)
         
-    target = deform(source)
+        # Target is randomly deformed
+        targets = []
+        deform = Deformation(device=DEVICE)
+        
+        # Generate random parameters
+        # Uniform random between -rot and +rot
+        rx = (torch.rand(bsize, device=DEVICE) * 2 - 1) * np.radians(rot_x)
+        ry = (torch.rand(bsize, device=DEVICE) * 2 - 1) * np.radians(rot_y)
+        rz = (torch.rand(bsize, device=DEVICE) * 2 - 1) * np.radians(rot_z)
+        
+        # Apply deformations
+        # Note: Deformation class accumulates transforms. We need fresh one or reset.
+        # But Deformation is not batched for parameters (it takes tuple of floats).
+        # We need to loop or use a batched deformation function if available.
+        # Our Deformation class wraps simple functions.
+        # Let's loop for simplicity (bsize is small, 32).
+        
+        for i in range(bsize):
+            d = Deformation(device=DEVICE)
+            d.rotate(euler_angles=(rx[i].item(), ry[i].item(), rz[i].item()))
+            if noise > 0:
+                # Random noise up to limit? Or fixed std?
+                # User slider says "Noise". Let's assume it's the std.
+                # Or if "batch fitting", maybe random noise up to that std?
+                # Let's use fixed std for now as per slider.
+                d.noise(std=noise)
+            if spherify > 0:
+                d.spherify(intensity=spherify)
+            
+            targets.append(d(s))
+            
+        t_batch = torch.stack(targets)
+        return s_batch, t_batch
+
+    # Generate Validation Batch (Fixed for Landscape)
+    val_batch_size = 32
+    val_source, val_target = generate_batch(val_batch_size)
+    
+    # Update n_points to actual generated size (e.g. for lattices)
+    actual_n_points = val_source.shape[1]
+    if actual_n_points != int(n_points):
+        print(f"Warning: Requested {n_points} points, but generated {actual_n_points}. Updating network config.")
+        n_points = actual_n_points
     
     # 2. Setup Network & Trainer
     model = AlignmentNetwork(encoder_type=net_type, head_type=head_type, num_points=int(n_points))
@@ -461,22 +499,19 @@ def run_network_landscape_analysis(
     weight_history = []
     loss_history = []
     
-    # Create batch (size 2 for BatchNorm)
-    # Add noise to second element to avoid BN collapse (zero variance)
-    source_noisy = source + 0.01 * torch.randn_like(source)
-    target_noisy = target + 0.01 * torch.randn_like(target)
-    
-    source_batch = torch.stack([source, source_noisy])
-    target_batch = torch.stack([target, target_noisy])
-    
-    # Force initialization of lazy layers (e.g. projection)
-    model(target_batch, source_batch)
+    # Force initialization
+    model(val_target, val_source)
     
     # Initial weights
     weight_history.append(get_params_vector(model).detach().cpu())
     
+    train_batch_size = 32
+    
     for i in range(int(epochs)):
-        loss = trainer.train_step(target_batch, source_batch) # Align target to source
+        # Generate new training batch
+        train_source, train_target = generate_batch(train_batch_size)
+        
+        loss = trainer.train_step(train_target, train_source) # Align target to source
         loss_history.append(loss)
         weight_history.append(get_params_vector(model).detach().cpu())
         
@@ -596,13 +631,13 @@ def run_network_landscape_analysis(
             module.track_running_stats = False
             
     losses_list = []
-    batch_size = 20
+    batch_size = 128
     
     try:
         with torch.no_grad():
             # Ensure batch inputs are on device
-            target_batch = target_batch.to(DEVICE)
-            source_batch = source_batch.to(DEVICE)
+            target_batch = val_target.to(DEVICE)
+            source_batch = val_source.to(DEVICE)
             
             num_points = grid_coords_t.shape[0]
             for i in range(0, num_points, batch_size):
@@ -642,7 +677,9 @@ def run_network_landscape_analysis(
     fig = go.Figure()
     
     # Surface
-    fig.add_trace(go.Surface(x=x_grid, y=y_grid, z=loss_grid, colorscale='Viridis', opacity=0.8, name='Loss Landscape'))
+    # Use log scale for better color distribution
+    log_loss_grid = np.log10(loss_grid + 1e-10)
+    fig.add_trace(go.Surface(x=x_grid, y=y_grid, z=log_loss_grid, surfacecolor=log_loss_grid, colorscale='Viridis', opacity=0.8, name='Loss Landscape'))
     
     # Trajectory
     # We need z-values for trajectory. We have loss_history, but that's training loss (with noise/dropout etc).
@@ -658,16 +695,25 @@ def run_network_landscape_analysis(
     with torch.no_grad():
         for w_vec in weight_history:
             set_params_vector(model, w_vec.to(DEVICE))
-            outputs = model(target_batch, source_batch)
+            outputs = model(val_target, val_source)
             # Use batched chamfer and mean to match grid calculation
-            l = chamfer_distance_batched(outputs['transformed_source'], source_batch).mean().item()
+            l = chamfer_distance_batched(outputs['transformed_source'], val_source).mean().item()
             traj_losses.append(l)
             
+    # Log scale for trajectory
+    log_traj_losses = np.log10(np.array(traj_losses) + 1e-10)
+    
     fig.add_trace(go.Scatter3d(
-        x=proj_x, y=proj_y, z=traj_losses,
+        x=proj_x, y=proj_y, z=log_traj_losses,
         mode='lines+markers',
-        line=dict(color='red', width=5),
-        marker=dict(size=4, color='red'),
+        line=dict(color='white', width=3), # White line to connect
+        marker=dict(
+            size=5, 
+            color=list(range(len(traj_losses))), # Color by step
+            colorscale='Turbo',
+            showscale=True,
+            colorbar=dict(title="Step")
+        ),
         name='Optimization Path'
     ))
     
@@ -676,7 +722,7 @@ def run_network_landscape_analysis(
         scene=dict(
             xaxis_title="PC1",
             yaxis_title="PC2",
-            zaxis=dict(title="Loss", type="log")
+            zaxis=dict(title="Log10(Loss)")
         ),
         height=800
     )
@@ -684,18 +730,52 @@ def run_network_landscape_analysis(
     # 8. Aligned Cloud Visualization
     # Use final weights
     set_params_vector(model, W[-1].to(DEVICE))
+    
+    # Generate specific test case for visualization (using slider values)
+    test_source = generate_point_cloud(StructureType(struct_type), int(n_points), device=DEVICE)
+    test_source = normalize_point_cloud(test_source)
+    
+    test_deform = Deformation(device=DEVICE)
+    test_deform.rotate(euler_angles=(np.radians(rot_x), np.radians(rot_y), np.radians(rot_z)))
+    if noise > 0:
+        test_deform.noise(std=noise)
+    if spherify > 0:
+        test_deform.spherify(intensity=spherify)
+    test_target = test_deform(test_source)
+    
+    # Batch it for model
+    test_source_b = test_source.unsqueeze(0)
+    test_target_b = test_target.unsqueeze(0)
+    
+    # Use eval mode for final visualization (inference)
+    model.eval()
     with torch.no_grad():
-        outputs = model(target_batch, source_batch)
+        outputs = model(test_target_b, test_source_b)
         transformed = outputs['transformed_source'][0]
         
     fig_cloud = render_overlay(
-        transformed, source,
+        transformed, test_source,
         color1='green', color2='blue',
         label1='Aligned', label2='Target (Reference)',
-        title="Final Alignment Result"
+        title="Final Alignment Result (Specific Test Case)"
     )
     
-    return fig, fig_cloud
+    # 9. Training Loss Plot
+    fig_loss = go.Figure()
+    fig_loss.add_trace(go.Scatter(
+        x=list(range(len(traj_losses))),
+        y=traj_losses,
+        mode='lines+markers',
+        name='Training Loss'
+    ))
+    fig_loss.update_layout(
+        title="Training Loss vs Steps",
+        xaxis_title="Step",
+        yaxis_title="Loss",
+        yaxis_type="log"
+    )
+    
+    return fig, fig_cloud, fig_loss
 
 # --- UI Layout ---
 
@@ -843,8 +923,8 @@ with gr.Blocks(title="Point Cloud Intuition") as app:
         with gr.Row():
             with gr.Column():
                 gr.Markdown("### Structure Config")
-                analysis_struct = gr.Dropdown(get_structure_types(), value="lattice_simple_cubic", label="Structure")
-                analysis_n = gr.Number(value=512, label="Points")
+                analysis_struct = gr.Dropdown(get_structure_types(), value="lattice_fcc", label="Structure")
+                analysis_n = gr.Number(value=128, label="Points")
                 
             with gr.Column():
                 gr.Markdown("### Network / Loss Config")
@@ -887,7 +967,9 @@ with gr.Blocks(title="Point Cloud Intuition") as app:
                 
             with gr.Column():
                 net_landscape_plot = gr.Plot(label="Network Loss Landscape (3D)")
-                net_cloud_plot = gr.Plot(label="Final Aligned Cloud")
+                with gr.Row():
+                    net_cloud_plot = gr.Plot(label="Final Aligned Cloud")
+                    net_loss_plot = gr.Plot(label="Training Loss")
                 
         btn_net_analysis.click(
             run_network_landscape_analysis,
@@ -896,7 +978,7 @@ with gr.Blocks(title="Point Cloud Intuition") as app:
                 net_lr, net_epochs, grid_res,
                 net_rot_x, net_rot_y, net_rot_z, net_noise, net_spherify
             ],
-            outputs=[net_landscape_plot, net_cloud_plot]
+            outputs=[net_landscape_plot, net_cloud_plot, net_loss_plot]
         )
 
 if __name__ == "__main__":
