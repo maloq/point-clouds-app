@@ -8,10 +8,12 @@ import numpy as np
 import plotly.graph_objects as go
 from typing import Dict, Any, List
 import time
+import torch.nn as nn
+from torch.func import functional_call, vmap
 
 from structures.generators import StructureType, generate_point_cloud, center_point_cloud, normalize_point_cloud
 from structures.deformations import Deformation, RandomDeformation
-from metrics.chamfer import chamfer_distance
+from metrics.chamfer import chamfer_distance, chamfer_distance_batched
 from metrics.emd import emd_approximate
 from metrics.hausdorff import hausdorff_distance
 from metrics.gromov import gromov_wasserstein_distance
@@ -19,7 +21,8 @@ from metrics.spectral import spectral_distance
 from visualization.point_cloud import render_cloud, render_overlay, render_heatmap, render_side_by_side
 from visualization.analysis import plot_geodesic_path, plot_loss_landscape
 from networks.training import AlignmentNetwork, Trainer
-from utils.rotation import euler_to_matrix, random_rotation_matrix, geodesic_distance
+from utils.rotation import euler_to_matrix, random_rotation_matrix, geodesic_distance, kabsch_alignment
+from utils.model_utils import get_params_vector, set_params_vector
 
 # Global state
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -114,6 +117,7 @@ def train_single_pair(
     struct_type, n_points,
     rot_x, rot_y, rot_z,
     noise, spherify,
+    method, # New argument
     network_type, head_type,
     lr, epochs,
     loss_type
@@ -134,6 +138,45 @@ def train_single_pair(
         
     target = deform(source)
     
+    # Calculate global bounding box for stable visualization
+    all_points = torch.cat([source, target], dim=0)
+    min_val = all_points.min().item()
+    max_val = all_points.max().item()
+    padding = (max_val - min_val) * 0.1
+    axis_range = (min_val - padding, max_val + padding)
+    
+    if method == "Kabsch Algorithm":
+        # Algorithmic Alignment
+        R, t, transformed = kabsch_alignment(source.unsqueeze(0), target.unsqueeze(0))
+        transformed = transformed.squeeze(0)
+        
+        # Calculate loss (Chamfer)
+        loss = chamfer_distance(transformed, target).item()
+        
+        fig = render_overlay(
+            transformed, source, # Source is actually Target in the overlay logic usually? 
+            # Wait, render_overlay(cloud1, cloud2). 
+            # In previous code: render_overlay(transformed, source, ...)
+            # Label1='Aligned Deformed', Label2='Original (Target)'
+            # Here: transformed is aligned source. target is the target.
+            # So we want to align Source to Target.
+            # Transformed Source should match Target.
+            transformed, target,
+            color1='green', color2='red', 
+            label1='Aligned Source', label2='Target', 
+            title=f"Kabsch Alignment, Loss: {loss:.6f}",
+            axis_range=axis_range,
+            height=800
+        )
+        
+        loss_fig = go.Figure()
+        loss_fig.add_trace(go.Scatter(x=[0], y=[loss], mode='markers', name='Loss'))
+        loss_fig.update_layout(title="Alignment Loss (Kabsch)", yaxis_type="log")
+        
+        yield fig, loss_fig, f"Done! Kabsch Loss: {loss:.6f}"
+        return
+
+    # Neural Network Training
     # Setup Network
     CURRENT_NETWORK = AlignmentNetwork(encoder_type=network_type, head_type=head_type, num_points=int(n_points))
     TRAINER = Trainer(CURRENT_NETWORK, lr=lr, loss_type=loss_type, device=DEVICE)
@@ -146,16 +189,15 @@ def train_single_pair(
     source_batch = torch.stack([source, source_noisy]) # [2, N, 3]
     target_batch = torch.stack([target, target_noisy])
     
-    # Calculate global bounding box for stable visualization
-    all_points = torch.cat([source, target], dim=0)
-    min_val = all_points.min().item()
-    max_val = all_points.max().item()
-    # Add some padding
-    padding = (max_val - min_val) * 0.1
-    axis_range = (min_val - padding, max_val + padding)
-    
     for i in range(int(epochs)):
         # Train: Align Deformed (target) to Original (source)
+        # Wait, in original code: loss = TRAINER.train_step(target_batch, source_batch)
+        # This means input=target_batch, target=source_batch.
+        # So it was aligning Target -> Source?
+        # "Train: Align Deformed (target) to Original (source)"
+        # If so, transformed is transformed target.
+        # Let's stick to the original logic for NN.
+        
         loss = TRAINER.train_step(target_batch, source_batch)
         LOSS_HISTORY.append(loss)
         
@@ -277,70 +319,383 @@ def test_generalization(struct_type, n_points, max_rot, max_noise):
 
 # --- Tab 4: Analysis ---
 
-def run_analysis(struct_type, n_points):
-    # 1. Loss Landscape
-    # We need a trained network or just a metric landscape?
-    # Prompt says: "Perturb rotation parameters in 2 random directions from optimal, calculate loss, plot 2D Heatmap."
-    
+def run_analysis(struct_type, n_points, net_type, head_type, loss_type):
+    # Setup Loss Function
+    if loss_type == "chamfer":
+        criterion = chamfer_distance
+    elif loss_type == "sinkhorn":
+        def criterion(x, y):
+            # Sinkhorn wrapper for batch
+            if x.dim() == 3:
+                losses = []
+                for i in range(x.shape[0]):
+                    losses.append(emd_approximate(x[i], y[i], method='sinkhorn'))
+                return torch.stack(losses).mean()
+            return emd_approximate(x, y, method='sinkhorn')
+    elif loss_type == "pairwise":
+        # Placeholder for pairwise if not imported directly, but we can try to use a simple metric
+        # or just fallback to chamfer if not available in this scope easily without importing
+        # Let's assume we want to use the one from metrics.invariant if available, 
+        # but for now let's stick to chamfer/sinkhorn/hausdorff for landscape
+        # If user selected pairwise, we might need to import it.
+        # Let's use chamfer as fallback or import it.
+        from metrics.invariant import pairwise_distance_distribution_distance
+        def criterion(x, y):
+             if x.dim() == 3:
+                losses = []
+                for i in range(x.shape[0]):
+                    losses.append(pairwise_distance_distribution_distance(x[i], y[i]))
+                return torch.stack(losses).mean()
+             return pairwise_distance_distribution_distance(x, y)
+    else:
+        criterion = chamfer_distance
+
     cloud = generate_point_cloud(StructureType(struct_type), int(n_points), device=DEVICE)
     cloud = normalize_point_cloud(cloud)
     target = cloud.clone() # Optimal is identity
     
-    # Grid of rotations around identity
-    N = 20
-    extent = 0.5 # radians
+    # --- 1. 1D Loss Landscape (0 to 360 degrees) ---
+    # Rotate around a random axis
+    axis = torch.randn(3, device=DEVICE)
+    axis = axis / axis.norm()
+    
+    angles_deg = np.linspace(0, 360, 100)
+    losses_1d = []
+    
+    for deg in angles_deg:
+        rad = np.radians(deg)
+        # Axis-angle rotation
+        K = torch.tensor([
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0]
+        ], device=DEVICE)
+        R = torch.eye(3, device=DEVICE) + torch.sin(torch.tensor(rad)) * K + (1 - torch.cos(torch.tensor(rad))) * (K @ K)
+        
+        rotated = cloud @ R.T
+        loss = criterion(rotated, target).item()
+        losses_1d.append(loss)
+        
+    fig_1d = go.Figure()
+    fig_1d.add_trace(go.Scatter(x=angles_deg, y=losses_1d, mode='lines', name='Loss'))
+    fig_1d.update_layout(
+        title=f"1D Loss Landscape ({loss_type}) - Rotation 0-360 deg",
+        xaxis_title="Rotation Angle (degrees)",
+        yaxis_title="Loss",
+        yaxis_type="log"
+    )
+
+    # --- 2. 2D Loss Landscape (Local Minima Check) ---
+    # Grid of rotations around identity (or around a local minimum if we found one?)
+    # Let's do a wider range to see basins
+    N = 30
+    extent = np.pi # +/- 180 degrees to see full landscape
     x = np.linspace(-extent, extent, N)
     y = np.linspace(-extent, extent, N)
     
-    losses = np.zeros((N, N))
+    losses_2d = np.zeros((N, N))
     
-    # Random axes
+    # Two random orthogonal axes
     axis1 = torch.randn(3, device=DEVICE)
     axis1 = axis1 / axis1.norm()
+    # Make axis2 orthogonal to axis1
     axis2 = torch.randn(3, device=DEVICE)
+    axis2 = axis2 - (axis2 @ axis1) * axis1
     axis2 = axis2 / axis2.norm()
     
     for i in range(N):
         for j in range(N):
-            # Construct rotation from two angles
-            # R = R(axis1, x[i]) @ R(axis2, y[j])
-            # Approximation for small angles
-            rot_vec = axis1 * x[i] + axis2 * y[j]
-            angle = rot_vec.norm()
-            if angle < 1e-6:
-                R = torch.eye(3, device=DEVICE)
-            else:
-                axis = rot_vec / angle
-                # Axis-angle to matrix
-                K = torch.tensor([
-                    [0, -axis[2], axis[1]],
-                    [axis[2], 0, -axis[0]],
-                    [-axis[1], axis[0], 0]
-                ], device=DEVICE)
-                R = torch.eye(3, device=DEVICE) + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
-                
-            rotated = cloud @ R.T
-            losses[i, j] = chamfer_distance(rotated, target).item()
+            # Combined rotation: R = R(axis1, x[i]) @ R(axis2, y[j])
+            # Construct R1
+            rad1 = torch.tensor(x[i], device=DEVICE)
+            K1 = torch.tensor([[0, -axis1[2], axis1[1]], [axis1[2], 0, -axis1[0]], [-axis1[1], axis1[0], 0]], device=DEVICE)
+            R1 = torch.eye(3, device=DEVICE) + torch.sin(rad1) * K1 + (1 - torch.cos(rad1)) * (K1 @ K1)
             
-    fig_landscape = plot_loss_landscape(0, losses, extent, title="Chamfer Loss Landscape (Rotation)")
+            # Construct R2
+            rad2 = torch.tensor(y[j], device=DEVICE)
+            K2 = torch.tensor([[0, -axis2[2], axis2[1]], [axis2[2], 0, -axis2[0]], [-axis2[1], axis2[0], 0]], device=DEVICE)
+            R2 = torch.eye(3, device=DEVICE) + torch.sin(rad2) * K2 + (1 - torch.cos(rad2)) * (K2 @ K2)
+            
+            R = R1 @ R2
+            
+            rotated = cloud @ R.T
+            losses_2d[i, j] = criterion(rotated, target).item()
+            
+    fig_2d = plot_loss_landscape(0, losses_2d, extent, title=f"2D Loss Landscape ({loss_type})")
     
-    # 2. Multi-metric convergence
-    # Simulate a convergence path (e.g. simple gradient descent on rotation)
-    # Or just plot metrics vs rotation angle
+    return fig_1d, fig_2d
+
+def run_network_landscape_analysis(
+    struct_type, n_points,
+    net_type, head_type, loss_type,
+    lr, epochs, grid_res,
+    rot_x, rot_y, rot_z,
+    noise, spherify
+):
+    # Clean memory before starting
+    torch.cuda.empty_cache()
     
-    rot_start = random_rotation_matrix((), device=DEVICE)
-    rot_end = torch.eye(3, device=DEVICE)
+    # Handle missing grid_res
+    if grid_res is None:
+        grid_res = 20
     
-    metrics = {
-        'Chamfer': chamfer_distance,
-        'Hausdorff': hausdorff_distance,
-        'Spectral': spectral_distance
-    }
+    # 1. Setup Data
+    source = generate_point_cloud(StructureType(struct_type), int(n_points), device=DEVICE)
+    source = normalize_point_cloud(source)
     
-    fig_convergence = plot_geodesic_path(cloud, target, rot_start, rot_end, steps=30, metrics=metrics)
-    fig_convergence.update_layout(title="Metric Convergence (Geodesic Path to Identity)")
+    # Target is deformed source
+    deform = Deformation(device=DEVICE)
+    deform.rotate(euler_angles=(np.radians(rot_x), np.radians(rot_y), np.radians(rot_z)))
+    if noise > 0:
+        deform.noise(std=noise)
+    if spherify > 0:
+        deform.spherify(intensity=spherify)
+        
+    target = deform(source)
     
-    return fig_landscape, fig_convergence
+    # 2. Setup Network & Trainer
+    model = AlignmentNetwork(encoder_type=net_type, head_type=head_type, num_points=int(n_points))
+    trainer = Trainer(model, lr=lr, loss_type=loss_type, device=DEVICE)
+    
+    # 3. Train and Record Trajectory
+    weight_history = []
+    loss_history = []
+    
+    # Create batch (size 2 for BatchNorm)
+    # Add noise to second element to avoid BN collapse (zero variance)
+    source_noisy = source + 0.01 * torch.randn_like(source)
+    target_noisy = target + 0.01 * torch.randn_like(target)
+    
+    source_batch = torch.stack([source, source_noisy])
+    target_batch = torch.stack([target, target_noisy])
+    
+    # Force initialization of lazy layers (e.g. projection)
+    model(target_batch, source_batch)
+    
+    # Initial weights
+    weight_history.append(get_params_vector(model).detach().cpu())
+    
+    for i in range(int(epochs)):
+        loss = trainer.train_step(target_batch, source_batch) # Align target to source
+        loss_history.append(loss)
+        weight_history.append(get_params_vector(model).detach().cpu())
+        
+    # Stack weights: [T, D]
+    W = torch.stack(weight_history)
+    
+    # 4. PCA on Trajectory
+    # Center the weights
+    W_mean = W.mean(dim=0)
+    W_centered = W - W_mean
+    
+    # PCA using SVD
+    # W_centered is [T, D]. If D >> T, better to do PCA on W W^T?
+    # torch.pca_lowrank is good.
+    U, S, V = torch.pca_lowrank(W_centered, q=2, center=False, niter=10)
+    
+    # Top 2 directions (V is [D, 2])
+    v1 = V[:, 0]
+    v2 = V[:, 1]
+    
+    # Project trajectory onto plane
+    # Center on FINAL weights to make the minimum the focal point
+    W_final = W[-1]
+    W_centered = W - W_final
+    proj_x = (W_centered @ v1).cpu().numpy()
+    proj_y = (W_centered @ v2).cpu().numpy()
+    
+    # 5. Create Grid
+    # Add padding to cover the whole trajectory
+    x_min, x_max = proj_x.min(), proj_x.max()
+    y_min, y_max = proj_y.min(), proj_y.max()
+    
+    # Make grid square and centered
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    span = max(x_range, y_range) * 1.5 # 50% padding
+    
+    # Center is 0,0 because we centered W on W_final
+    limit = span / 2
+    x_grid = np.linspace(-limit, limit, int(grid_res))
+    y_grid = np.linspace(-limit, limit, int(grid_res))
+    
+    xx, yy = np.meshgrid(x_grid, y_grid)
+    loss_grid = np.zeros_like(xx)
+    
+    # 6. Evaluate Loss on Grid (Batched)
+    # Prepare Grid Inputs
+    grid_coords = np.stack([xx.flatten(), yy.flatten()], axis=1)
+    grid_coords_t = torch.tensor(grid_coords, dtype=torch.float32, device=DEVICE)
+    
+    # Prepare Projection Vectors
+    PCs = torch.stack([v1, v2]).to(DEVICE) # [2, D]
+    # Base is final weights
+    w_base = W_final.to(DEVICE)
+    
+    # Calculate ALL weight configurations at once -> MOVED TO CHUNK LOOP
+    # all_weights = w_base + grid_coords_t @ PCs
+    
+    # Prepare model metadata for stateless call
+    param_names = [n for n, _ in model.named_parameters() if _.requires_grad]
+    param_shapes = [p.shape for p in model.parameters() if p.requires_grad]
+    param_numels = [p.numel() for p in model.parameters() if p.requires_grad]
+    
+    def compute_loss_stateless(flat_params, target_b, source_b):
+        # Reconstruct parameters dictionary
+        params = {}
+        idx = 0
+        for name, shape, numel in zip(param_names, param_shapes, param_numels):
+            params[name] = flat_params[idx : idx + numel].view(shape)
+            idx += numel
+            
+        outputs = functional_call(model, params, (target_b, source_b))
+        transformed = outputs['transformed_source']
+        
+        # Loss
+        if loss_type == "chamfer":
+            # Chamfer batched
+            l = chamfer_distance_batched(transformed, source_b, bidirectional=True).mean()
+        elif loss_type == "sinkhorn":
+            # Sinkhorn might not be vmap-friendly if it has in-place ops or loops?
+            # Our sinkhorn implementation uses loops. vmap might fail or be slow if not pure.
+            # Let's try. If it fails, fallback to loop?
+            # For now, assume chamfer for speed or simple loop inside vmap (which is fine).
+            # But vmap runs the function for a *single* example (conceptually).
+            # Here 'target_b' is a BATCH of points.
+            # vmap is over the WEIGHTS dimension (dim 0 of flat_params).
+            # So inside this function, flat_params is 1D. target_b is [B, N, 3].
+            # The output of functional_call will be [B, N, 3].
+            # chamfer_distance returns [B] or scalar?
+            # Our chamfer_distance_batched returns [B]. .mean() -> scalar.
+            # So this function returns a scalar loss for this set of weights.
+            
+            # Sinkhorn:
+            losses = []
+            for i in range(transformed.shape[0]):
+                losses.append(emd_approximate(transformed[i], source_b[i], method='sinkhorn'))
+            l = torch.stack(losses).mean()
+        else:
+            l = chamfer_distance(transformed, source_b, bidirectional=True).mean()
+            
+        return l
+
+    # Vectorize
+    # in_dims=(0, None, None) -> Split arg0 (weights) along dim 0.
+    compute_loss_vmap = vmap(compute_loss_stateless, in_dims=(0, None, None))
+    
+    # Execute in chunks to avoid OOM
+    # Use train mode to use batch statistics (consistent with trajectory)
+    model.train()
+    
+    # Disable track_running_stats for vmap to avoid in-place updates of running_mean/var
+    # We only want to USE batch stats, not update the global model stats during visualization
+    original_track_running_stats = {}
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            original_track_running_stats[name] = module.track_running_stats
+            module.track_running_stats = False
+            
+    losses_list = []
+    batch_size = 20
+    
+    try:
+        with torch.no_grad():
+            # Ensure batch inputs are on device
+            target_batch = target_batch.to(DEVICE)
+            source_batch = source_batch.to(DEVICE)
+            
+            num_points = grid_coords_t.shape[0]
+            for i in range(0, num_points, batch_size):
+                # Chunk grid coords
+                grid_chunk = grid_coords_t[i : i + batch_size]
+                
+                # Generate weights for this chunk
+                # (B, 2) @ (2, D) -> (B, D)
+                chunk_weights = w_base + grid_chunk @ PCs
+                
+                # Compute loss
+                chunk_losses = compute_loss_vmap(chunk_weights, target_batch, source_batch)
+                losses_list.append(chunk_losses)
+                
+                # Clean up chunk memory
+                del chunk_weights
+                del chunk_losses
+                torch.cuda.empty_cache()
+                
+            losses = torch.cat(losses_list)
+    finally:
+        # Restore track_running_stats
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                if name in original_track_running_stats:
+                    module.track_running_stats = original_track_running_stats[name]
+        
+    loss_grid = losses.view(int(grid_res), int(grid_res)).cpu().numpy()
+    
+    # Restore final weights (just in case)
+    set_params_vector(model, W[-1].to(DEVICE))
+    torch.cuda.empty_cache()
+    
+
+    
+    # 7. Visualization
+    fig = go.Figure()
+    
+    # Surface
+    fig.add_trace(go.Surface(x=x_grid, y=y_grid, z=loss_grid, colorscale='Viridis', opacity=0.8, name='Loss Landscape'))
+    
+    # Trajectory
+    # We need z-values for trajectory. We have loss_history, but that's training loss (with noise/dropout etc).
+    # Ideally we re-evaluate loss on the exact path, or just use recorded loss.
+    # Recorded loss is fine for visualization.
+    # Note: loss_history has length epochs, weight_history has epochs+1.
+    # Let's assume initial loss is high.
+    
+    # Re-evaluate trajectory losses for consistency with grid
+    # Use train mode!
+    model.train()
+    traj_losses = []
+    with torch.no_grad():
+        for w_vec in weight_history:
+            set_params_vector(model, w_vec.to(DEVICE))
+            outputs = model(target_batch, source_batch)
+            # Use batched chamfer and mean to match grid calculation
+            l = chamfer_distance_batched(outputs['transformed_source'], source_batch).mean().item()
+            traj_losses.append(l)
+            
+    fig.add_trace(go.Scatter3d(
+        x=proj_x, y=proj_y, z=traj_losses,
+        mode='lines+markers',
+        line=dict(color='red', width=5),
+        marker=dict(size=4, color='red'),
+        name='Optimization Path'
+    ))
+    
+    fig.update_layout(
+        title="Network Loss Landscape (PCA of Trajectory)",
+        scene=dict(
+            xaxis_title="PC1",
+            yaxis_title="PC2",
+            zaxis=dict(title="Loss", type="log")
+        ),
+        height=800
+    )
+    
+    # 8. Aligned Cloud Visualization
+    # Use final weights
+    set_params_vector(model, W[-1].to(DEVICE))
+    with torch.no_grad():
+        outputs = model(target_batch, source_batch)
+        transformed = outputs['transformed_source'][0]
+        
+    fig_cloud = render_overlay(
+        transformed, source,
+        color1='green', color2='blue',
+        label1='Aligned', label2='Target (Reference)',
+        title="Final Alignment Result"
+    )
+    
+    return fig, fig_cloud
 
 # --- UI Layout ---
 
@@ -416,7 +771,10 @@ with gr.Blocks(title="Point Cloud Intuition") as app:
                 t_spherify = gr.Slider(0, 1, value=0.0, label="Spherify")
                 
             with gr.Column():
-                gr.Markdown("### Network")
+                gr.Markdown("### Method")
+                method = gr.Dropdown(["Neural Network", "Kabsch Algorithm"], value="Neural Network", label="Alignment Method")
+                
+                gr.Markdown("### Network Config (if NN)")
                 net_type = gr.Dropdown(["mlp", "pointnet", "gnn"], value="pointnet", label="Encoder")
                 head_type = gr.Dropdown(["rotation", "flow", "combined"], value="rotation", label="Head")
                 loss_type = gr.Dropdown(["chamfer", "sinkhorn", "pairwise"], value="chamfer", label="Loss Function")
@@ -434,7 +792,7 @@ with gr.Blocks(title="Point Cloud Intuition") as app:
         
         btn_train.click(
             train_single_pair,
-            inputs=[train_struct, train_n, t_rot_x, t_rot_y, t_rot_z, t_noise, t_spherify, net_type, head_type, lr, epochs, loss_type],
+            inputs=[train_struct, train_n, t_rot_x, t_rot_y, t_rot_z, t_noise, t_spherify, method, net_type, head_type, lr, epochs, loss_type],
             outputs=[train_plot, loss_plot, train_status]
         )
 
@@ -479,20 +837,66 @@ with gr.Blocks(title="Point Cloud Intuition") as app:
         )
 
     with gr.Tab("Analysis"):
-        gr.Markdown("### Loss Landscape & Metric Convergence")
+        gr.Markdown("### Loss Landscape Analysis")
+        gr.Markdown("Visualize the loss landscape to check for local minima, especially for symmetric/crystal-like structures.")
+        
         with gr.Row():
-            analysis_struct = gr.Dropdown(get_structure_types(), value="sphere_surface", label="Structure")
-            analysis_n = gr.Number(value=512, label="Points")
-            btn_analysis = gr.Button("Run Analysis")
+            with gr.Column():
+                gr.Markdown("### Structure Config")
+                analysis_struct = gr.Dropdown(get_structure_types(), value="lattice_simple_cubic", label="Structure")
+                analysis_n = gr.Number(value=512, label="Points")
+                
+            with gr.Column():
+                gr.Markdown("### Network / Loss Config")
+                # Adding same controls as training tab
+                analysis_net_type = gr.Dropdown(["mlp", "pointnet", "gnn"], value="pointnet", label="Encoder")
+                analysis_head_type = gr.Dropdown(["rotation", "flow", "combined"], value="rotation", label="Head")
+                analysis_loss_type = gr.Dropdown(["chamfer", "sinkhorn", "pairwise"], value="chamfer", label="Loss Function")
+                
+                btn_analysis = gr.Button("Run Rotation Landscape")
             
         with gr.Row():
-            landscape_plot = gr.Plot(label="Loss Landscape")
-            convergence_plot = gr.Plot(label="Metric Convergence")
+            landscape_1d_plot = gr.Plot(label="1D Loss Landscape (360 deg)")
+            landscape_2d_plot = gr.Plot(label="2D Loss Landscape")
             
         btn_analysis.click(
             run_analysis,
-            inputs=[analysis_struct, analysis_n],
-            outputs=[landscape_plot, convergence_plot]
+            inputs=[analysis_struct, analysis_n, analysis_net_type, analysis_head_type, analysis_loss_type],
+            outputs=[landscape_1d_plot, landscape_2d_plot]
+        )
+        
+        gr.Markdown("---")
+        gr.Markdown("### Network Optimization Landscape")
+        gr.Markdown("Train a network, perform PCA on the weight trajectory, and visualize the loss landscape around the path.")
+        
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### Training Config")
+                net_lr = gr.Number(value=0.001, label="Learning Rate")
+                net_epochs = gr.Number(value=50, label="Epochs")
+                grid_res = gr.Number(value=20, label="Grid Resolution")
+                
+                gr.Markdown("### Target Deformation")
+                net_rot_x = gr.Slider(0, 180, value=45, label="Rot X")
+                net_rot_y = gr.Slider(0, 180, value=45, label="Rot Y")
+                net_rot_z = gr.Slider(0, 180, value=0, label="Rot Z")
+                net_noise = gr.Slider(0, 0.05, value=0.0, label="Noise")
+                net_spherify = gr.Slider(0, 1, value=0.0, label="Spherify")
+                
+                btn_net_analysis = gr.Button("Run Network Analysis")
+                
+            with gr.Column():
+                net_landscape_plot = gr.Plot(label="Network Loss Landscape (3D)")
+                net_cloud_plot = gr.Plot(label="Final Aligned Cloud")
+                
+        btn_net_analysis.click(
+            run_network_landscape_analysis,
+            inputs=[
+                analysis_struct, analysis_n, analysis_net_type, analysis_head_type, analysis_loss_type, 
+                net_lr, net_epochs, grid_res,
+                net_rot_x, net_rot_y, net_rot_z, net_noise, net_spherify
+            ],
+            outputs=[net_landscape_plot, net_cloud_plot]
         )
 
 if __name__ == "__main__":

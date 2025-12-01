@@ -429,3 +429,74 @@ def sample_rotation_heatmap(n_samples_per_axis: int = 50,
     rotations = euler_to_matrix(euler)
     
     return angles, angles, rotations
+
+
+def kabsch_alignment(
+    source: torch.Tensor,
+    target: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Align source to target using Kabsch algorithm.
+    Assumes 1-to-1 correspondence.
+    
+    Args:
+        source: Source point cloud [B, N, 3] or [N, 3]
+        target: Target point cloud [B, N, 3] or [N, 3]
+        
+    Returns:
+        R: Rotation matrix [B, 3, 3] or [3, 3]
+        t: Translation vector [B, 3] or [3]
+        transformed_source: Aligned source [B, N, 3] or [N, 3]
+    """
+    # Handle non-batch input
+    if source.dim() == 2:
+        source = source.unsqueeze(0)
+        target = target.unsqueeze(0)
+        is_batch = False
+    else:
+        is_batch = True
+        
+    # 1. Center centroids
+    centroid_src = source.mean(dim=1, keepdim=True)
+    centroid_tgt = target.mean(dim=1, keepdim=True)
+    
+    src_centered = source - centroid_src
+    tgt_centered = target - centroid_tgt
+    
+    # 2. Covariance matrix
+    H = src_centered.transpose(1, 2) @ tgt_centered
+    
+    # 3. SVD
+    U, S, V = torch.linalg.svd(H)
+    
+    # 4. Rotation
+    # V @ U.T
+    # torch.linalg.svd returns U, S, Vh (V hermitian transpose)
+    # So R = Vh.T @ U.T = V @ U.T
+    # Wait, torch.linalg.svd returns U, S, Vh where A = U @ diag(S) @ Vh
+    # Kabsch: H = U @ S @ V.T
+    # R = V @ U.T
+    # In torch.linalg.svd: Vh is V.T. So V = Vh.T
+    # So R = Vh.T @ U.T = (U @ Vh).T
+    
+    Vh = V
+    R = Vh.mH @ U.transpose(-2, -1)
+    
+    # 5. Check reflection
+    det = torch.det(R)
+    mask = det < 0
+    if mask.any():
+        # Fix reflection by negating last column of V (or last row of Vh)
+        Vh[mask, 2, :] *= -1
+        R[mask] = Vh[mask].mH @ U[mask].transpose(-2, -1)
+        
+    # 6. Translation
+    t = centroid_tgt.squeeze(1) - (R @ centroid_src.squeeze(1).unsqueeze(-1)).squeeze(-1)
+    
+    # 7. Apply transformation
+    transformed_source = (R @ source.transpose(1, 2)).transpose(1, 2) + t.unsqueeze(1)
+    
+    if not is_batch:
+        return R.squeeze(0), t.squeeze(0), transformed_source.squeeze(0)
+        
+    return R, t, transformed_source

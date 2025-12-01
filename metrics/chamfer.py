@@ -18,11 +18,11 @@ def pairwise_distances(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         Distance matrix [N, M]
     """
     # ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x.y
-    xx = (x ** 2).sum(dim=-1, keepdim=True)  # [N, 1]
-    yy = (y ** 2).sum(dim=-1, keepdim=True)  # [M, 1]
-    xy = x @ y.T  # [N, M]
+    xx = (x ** 2).sum(dim=-1, keepdim=True)  # [..., N, 1]
+    yy = (y ** 2).sum(dim=-1, keepdim=True)  # [..., M, 1]
+    xy = x @ y.transpose(-1, -2)  # [..., N, M]
     
-    distances = xx + yy.T - 2 * xy
+    distances = xx + yy.transpose(-1, -2) - 2 * xy
     return torch.clamp(distances, min=0)  # Numerical stability
 
 
